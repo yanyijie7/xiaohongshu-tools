@@ -15,27 +15,36 @@ def load_config(config_path='config.ini'):
         'input_dir': config['PATH'].get('input_dir', 'input_images'),
         'base_image': config['PATH']['base_image'],
         'output_dir': config['PATH'].get('output_dir', 'output_images'),
-        'overlay_image': config['PATH'].get('overlay_image', '').strip()
+        'overlay_image': config['PATH'].get('overlay_image', '').strip(),
+        # 新增批量叠加图片路径配置
+        'batch_overlay_image': config['PATH'].get('batch_overlay_image', '').strip()
     }
 
-    # 处理配置（关键修复：target_index改为可选，且仅在有overlay时生效）
+    # 处理配置
     process_config = {
         'margin': int(config['PROCESS'].get('margin', 0)),
         'output_format': config['PROCESS'].get('output_format', 'png'),
         'target_index': None,  # 默认None
-        'multiply_blend': config['PROCESS'].getboolean('multiply_blend', False)
+        'multiply_blend': config['PROCESS'].getboolean('multiply_blend', False),
+        # 新增批量叠加数量配置，默认为0表示不启用
+        'batch_overlay_count': int(config['PROCESS'].get('batch_overlay_count', 0))
     }
 
     # 仅当配置了overlay_image时，才尝试读取target_index
     if path_config['overlay_image']:
-        # 检查是否存在target_index配置
         if 'target_index' not in config['PROCESS']:
             raise ValueError("配置了overlay_image时，必须同时设置target_index")
-        # 尝试转换为整数
         try:
             process_config['target_index'] = int(config['PROCESS']['target_index'])
         except ValueError:
             raise ValueError(f"target_index必须是整数，当前值: {config['PROCESS']['target_index']}")
+
+    # 验证批量叠加配置
+#     if path_config['batch_overlay_image']:
+#         if process_config['batch_overlay_count'] <= 0:
+#             raise ValueError("配置了batch_overlay_image时，必须设置大于0的batch_overlay_count")
+#         if not os.path.exists(path_config['batch_overlay_image']):
+#             raise FileNotFoundError(f"批量叠加图不存在: {path_config['batch_overlay_image']}")
 
     # 验证底图
     if not os.path.exists(path_config['base_image']):
@@ -49,39 +58,25 @@ def load_config(config_path='config.ini'):
 
 
 def get_all_image_paths(root_dir):
-    """递归获取所有图片的输入输出路径对"""
+    """递归获取所有图片的输入输出路径对，按文件夹分组"""
     image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff')
-    image_pairs = []
+    # 修改为按文件夹分组存储图片路径
+    folder_images = {}
 
     for dirpath, _, filenames in os.walk(root_dir):
-        # 计算相对路径用于构建输出目录
-        rel_path = os.path.relpath(dirpath, root_dir)
-        for filename in filenames:
-            if (filename.lower().endswith(image_extensions) 
-                and not filename.startswith('.')):  # 过滤隐藏文件
-                input_path = os.path.join(dirpath, filename)
-                output_subdir = os.path.join(config['path']['output_dir'], rel_path)
-                output_path = os.path.join(
-                    output_subdir, 
-                    f"{os.path.splitext(filename)[0]}.{config['process']['output_format']}"
-                )
-                image_pairs.append((input_path, output_path))
+        # 过滤并排序当前文件夹下的图片
+        image_files = [f for f in filenames 
+                      if f.lower().endswith(image_extensions) and not f.startswith('.')]
+        image_files.sort()  # 排序确保顺序一致
+        
+        if image_files:  # 只处理有图片的文件夹
+            folder_images[dirpath] = image_files
 
-    # 按路径排序确保处理顺序一致
-    return sorted(image_pairs, key=lambda x: x[0])
+    return folder_images
 
 
 def apply_multiply_blend(base_img, overlay_img, position):
-    """应用正片叠底混合模式
-    
-    Args:
-        base_img: 底图 (RGBA)
-        overlay_img: 叠加图片 (RGBA)
-        position: 叠加位置 (x, y)
-    
-    Returns:
-        处理后的图片
-    """
+    """应用正片叠底混合模式"""
     # 创建结果图片副本
     result = base_img.copy()
     
@@ -150,8 +145,9 @@ def apply_multiply_blend(base_img, overlay_img, position):
     return result
 
 
-def process_single_image(base_img, input_img_path, margin, overlay_img=None, multiply_blend=False):
-    """处理单张图片：缩放、居中叠加到底图，可选叠加覆盖图，支持正片叠底混合模式"""
+def process_single_image(base_img, input_img_path, margin, overlay_img=None, 
+                         multiply_blend=False, batch_overlay_img=None):
+    """处理单张图片：缩放、居中叠加到底图，支持多种叠加模式"""
     # 打开输入图片
     with Image.open(input_img_path).convert('RGBA') as input_img:
         # 计算可用区域（底图尺寸减去边距）
@@ -186,6 +182,13 @@ def process_single_image(base_img, input_img_path, margin, overlay_img=None, mul
             # 普通叠加模式
             result_img.paste(resized_img, (x, y), resized_img)
 
+        # 应用批量叠加图片（如果指定）
+        if batch_overlay_img:
+            # 缩放批量叠加图以匹配底图尺寸
+            batch_overlay_resized = batch_overlay_img.resize(base_img.size, Image.Resampling.LANCZOS)
+            # 应用正片叠底混合
+            result_img = apply_multiply_blend(result_img, batch_overlay_resized, (0, 0))
+
         # 叠加覆盖图（如果指定）
         if overlay_img:
             # 缩放覆盖图以匹配底图尺寸
@@ -200,9 +203,9 @@ def batch_process_images(config):
     path_cfg = config['path']
     process_cfg = config['process']
 
-    # 获取所有图片路径对
-    image_pairs = get_all_image_paths(path_cfg['input_dir'])
-    if not image_pairs:
+    # 获取所有图片路径（按文件夹分组）
+    folder_images = get_all_image_paths(path_cfg['input_dir'])
+    if not folder_images:
         print("未找到任何图片文件，程序退出")
         return
 
@@ -212,52 +215,84 @@ def batch_process_images(config):
         overlay_img = None
         if path_cfg['overlay_image']:
             overlay_img = Image.open(path_cfg['overlay_image']).convert('RGBA')
-            # 验证目标序号有效性
-            if (process_cfg['target_index'] < 1 
-                or process_cfg['target_index'] > len(image_pairs)):
-                raise ValueError(
-                    f"target_index超出范围，有效范围: 1-{len(image_pairs)}"
+        
+        # 加载批量叠加图（若配置）
+        batch_overlay_img = None
+        if path_cfg['batch_overlay_image'] and process_cfg['batch_overlay_count'] > 0:
+            batch_overlay_img = Image.open(path_cfg['batch_overlay_image']).convert('RGBA')
+
+        total_images = sum(len(images) for images in folder_images.values())
+        current_idx = 1
+        
+        # 遍历每个文件夹处理图片
+        for dirpath, image_files in folder_images.items():
+            # 计算相对路径用于构建输出目录
+            rel_path = os.path.relpath(dirpath, path_cfg['input_dir'])
+            output_subdir = os.path.join(path_cfg['output_dir'], rel_path)
+            
+            # 确定需要应用批量叠加的图片索引
+            batch_overlay_indices = set()
+            if batch_overlay_img:
+                n = process_cfg['batch_overlay_count']
+                # 获取最后n张图片的索引（如果图片数量少于n则全部应用）
+                start_idx = max(0, len(image_files) - n)
+                batch_overlay_indices = set(range(start_idx, len(image_files)))
+
+            # 处理当前文件夹中的图片
+            for img_idx, filename in enumerate(image_files):
+                input_path = os.path.join(dirpath, filename)
+                output_path = os.path.join(
+                    output_subdir, 
+                    f"{os.path.splitext(filename)[0]}.{process_cfg['output_format']}"
                 )
+                
+                try:
+                    # 创建输出目录
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # 遍历处理图片
-        for idx, (input_path, output_path) in enumerate(image_pairs, start=1):
-            try:
-                # 创建输出目录
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    # 判断是否需要叠加覆盖图
+                    current_overlay = overlay_img if (
+                        overlay_img and current_idx == process_cfg['target_index']
+                    ) else None
 
-                # 判断是否需要叠加覆盖图
-                current_overlay = overlay_img if (
-                    overlay_img and idx == process_cfg['target_index']
-                ) else None
+                    # 判断是否需要应用批量叠加
+                    current_batch_overlay = batch_overlay_img if (
+                        batch_overlay_img and img_idx in batch_overlay_indices
+                    ) else None
 
-                # 处理图片
-                result_img = process_single_image(
-                    base_img=base_img,
-                    input_img_path=input_path,
-                    margin=process_cfg['margin'],
-                    overlay_img=current_overlay,
-                    multiply_blend=process_cfg['multiply_blend']
-                )
+                    # 处理图片
+                    result_img = process_single_image(
+                        base_img=base_img,
+                        input_img_path=input_path,
+                        margin=process_cfg['margin'],
+                        overlay_img=current_overlay,
+                        multiply_blend=process_cfg['multiply_blend'],
+                        batch_overlay_img=current_batch_overlay
+                    )
 
-                # 保存结果
-                result_img.save(output_path)
-                print(f"[{idx}/{len(image_pairs)}] 已保存: {output_path}")
+                    # 保存结果
+                    result_img.save(output_path)
+                    print(f"[{current_idx}/{total_images}] 已保存: {output_path}")
 
-                # 处理到目标序号且有覆盖图时停止
-                if current_overlay:
-                    print(f"已处理目标序号 {idx}，停止处理")
-                    break
+                    # 处理到目标序号且有覆盖图时停止
+                    if current_overlay:
+                        print(f"已处理目标序号 {current_idx}，停止处理")
+                        return
 
-            except Exception as e:
-                print(f"[{idx}] 处理失败 {input_path}: {str(e)}")
-                # 目标图片处理失败时终止程序
-                if overlay_img and idx == process_cfg['target_index']:
-                    print("目标图片处理失败，程序终止")
-                    return
+                    current_idx += 1
 
-    # 关闭覆盖图
-    if overlay_img:
-        overlay_img.close()
+                except Exception as e:
+                    print(f"[{current_idx}] 处理失败 {input_path}: {str(e)}")
+                    # 目标图片处理失败时终止程序
+                    if overlay_img and current_idx == process_cfg['target_index']:
+                        print("目标图片处理失败，程序终止")
+                        return
+
+        # 关闭覆盖图
+        if overlay_img:
+            overlay_img.close()
+        if batch_overlay_img:
+            batch_overlay_img.close()
 
 
 if __name__ == "__main__":
